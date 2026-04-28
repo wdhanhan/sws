@@ -1,0 +1,6 @@
+DROP TABLE IF EXISTS inventory;
+DROP TABLE IF EXISTS item_defs;
+DROP TABLE IF EXISTS asteroid_belts;
+DROP TABLE IF EXISTS planets;
+DROP TABLE IF EXISTS stargates;
+DROP TABLE IF EXISTS star_systems;

@@ -1,0 +1,11 @@
+id,name,npc_type,tier,shield_hp,armor_hp,structure_hp,shield_recharge,damage_per_tick,damage_type,optimal_range,speed,signature,bounty,ai_behavior,shield_res_kinetic,shield_res_thermal,shield_res_em,shield_res_explosive,armor_res_kinetic,armor_res_thermal,armor_res_em,armor_res_explosive,warp_speed,align_ticks
+1,失控清扫者,machine,1,300,200,150,8,30,kinetic,10000,250,50,500,aggressive,0.35,0.15,0.05,0.2,0.45,0.2,0.05,0.25,1.5,8
+2,游荡哨兵,machine,2,800,600,400,15,60,kinetic,15000,200,80,2000,aggressive,0.35,0.15,0.05,0.2,0.45,0.2,0.05,0.25,1.5,8
+3,歼灭者,machine,3,2000,1500,1000,25,120,thermal,20000,180,120,8000,aggressive,0.35,0.15,0.05,0.2,0.45,0.2,0.05,0.25,1.5,8
+4,自走堡垒,machine,4,5000,4000,3000,40,200,thermal,25000,100,250,25000,defensive,0.35,0.15,0.05,0.2,0.45,0.2,0.05,0.25,1.5,8
+5,毁灭核心,machine,5,15000,10000,8000,60,400,explosive,30000,80,400,100000,aggressive,0.35,0.15,0.05,0.2,0.45,0.2,0.05,0.25,1.5,8
+10,真空水母,alien,1,200,100,300,5,20,em,5000,150,60,300,passive,0.05,0.4,0.2,0.1,0.1,0.45,0.15,0.15,0,99
+11,星际鲨,alien,2,500,800,600,10,80,kinetic,8000,400,70,3000,aggressive,0.05,0.4,0.2,0.1,0.1,0.45,0.15,0.15,0,99
+12,虫巢体,alien,3,1000,2000,1500,15,50,thermal,12000,120,200,10000,spawner,0.05,0.4,0.2,0.1,0.1,0.45,0.15,0.15,0,99
+20,相位幽灵,dimension,2,600,300,500,20,70,em,18000,350,40,5000,evasive,0.2,0.05,0.3,0.45,0.15,0.05,0.35,0.5,0,1
+21,空间折叠兽,dimension,3,1500,1000,800,25,100,explosive,15000,250,100,12000,aggressive,0.2,0.05,0.3,0.45,0.15,0.05,0.35,0.5,0,1
