@@ -25,18 +25,24 @@ type siteSession struct {
 	BossName   string
 	NPCBounty  int64
 	NPCCount   int
+	FleetID    int64
+	MemberIDs  []int64
+	ShipIDs    map[int64]int64 // charID -> shipID
 }
 
 type CombatSiteService struct {
 	db       *sqlx.DB
 	invRepo  *repository.InventoryRepo
-	sessions map[int64]*siteSession // charID -> session
+	fleetSvc *FleetService
+	sessions map[int64]*siteSession // charID -> session (fleet members share pointer)
 	mu       sync.RWMutex
 }
 
 func NewCombatSiteService(db *sqlx.DB, invRepo *repository.InventoryRepo) *CombatSiteService {
 	return &CombatSiteService{db: db, invRepo: invRepo, sessions: make(map[int64]*siteSession)}
 }
+
+func (s *CombatSiteService) SetFleetService(fs *FleetService) { s.fleetSvc = fs }
 
 func (s *CombatSiteService) DB() *sqlx.DB { return s.db }
 
@@ -261,17 +267,33 @@ type SiteFightResult struct {
 	Rewards     []string           `json:"rewards,omitempty"`
 }
 
-// EnterSite 进入地点，初始化当前波的战斗引擎（不自动打，等玩家逐Tick推进）
+// EnterSite 进入地点，支持舰队组队
 func (s *CombatSiteService) EnterSite(ctx context.Context, charID, siteID int64) (*SiteFightResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 如果已有session，直接返回状态
 	if sess, ok := s.sessions[charID]; ok {
 		return &SiteFightResult{
 			SiteID: sess.SiteID, SiteName: "", WaveNumber: sess.Wave, TotalWaves: sess.TotalWaves,
 			WaveText: sess.WaveText, IsBoss: sess.IsBoss, Combat: sess.Engine.State,
 		}, nil
+	}
+
+	// Determine participants: solo or fleet
+	memberIDs := []int64{charID}
+	var fleetID int64
+	if s.fleetSvc != nil {
+		inFleet, fid, leaderID := s.fleetSvc.IsInFleet(ctx, charID)
+		if inFleet {
+			if leaderID != charID {
+				return nil, fmt.Errorf("请等待队长进入战斗地点")
+			}
+			fleetID = fid
+			ids, _ := s.fleetSvc.GetFleetMemberIDs(ctx, fid)
+			if len(ids) > 0 {
+				memberIDs = ids
+			}
+		}
 	}
 
 	var site struct {
@@ -288,7 +310,6 @@ func (s *CombatSiteService) EnterSite(ctx context.Context, charID, siteID int64)
 		return nil, fmt.Errorf("地点不可用(状态:%s)", site.Status)
 	}
 
-	// 创建副本实例
 	var instID int64
 	var currentWave int
 	err := s.db.QueryRowContext(ctx,
@@ -305,16 +326,26 @@ func (s *CombatSiteService) EnterSite(ctx context.Context, charID, siteID int64)
 	var waveCount int
 	s.db.GetContext(ctx, &waveCount, `SELECT wave_count FROM dungeon_defs WHERE id=$1`, site.DungeonDefID)
 
-	// 初始化当前波战斗
-	sess := s.initWaveCombat(ctx, charID, site.DungeonDefID, currentWave)
+	sess := s.initWaveCombatFleet(ctx, memberIDs, site.DungeonDefID, currentWave)
 	sess.SiteID = siteID
 	sess.InstID = instID
 	sess.DungeonID = site.DungeonDefID
 	sess.Wave = currentWave
 	sess.TotalWaves = waveCount
-	s.sessions[charID] = sess
+	sess.FleetID = fleetID
+	sess.MemberIDs = memberIDs
+	sess.ShipIDs = make(map[int64]int64)
+	for _, mid := range memberIDs {
+		var shipID int64
+		s.db.GetContext(ctx, &shipID, `SELECT id FROM ships WHERE character_id=$1 AND is_active=true LIMIT 1`, mid)
+		if shipID > 0 { sess.ShipIDs[mid] = shipID }
+	}
 
-	// 处理第一个Tick
+	// Store session for all members
+	for _, mid := range memberIDs {
+		s.sessions[mid] = sess
+	}
+
 	sess.Engine.ProcessTick()
 
 	return &SiteFightResult{
@@ -385,62 +416,164 @@ func (s *CombatSiteService) processWaveEnd(ctx context.Context, charID int64, se
 		Combat: sess.Engine.State,
 	}
 
+	members := sess.MemberIDs
+	if len(members) == 0 {
+		members = []int64{charID}
+	}
+
+	// Process destroyed player ships -> create wrecks
+	for _, p := range sess.Engine.State.Participants {
+		if p.Type != "player" || !p.IsDestroyed { continue }
+		shipID := sess.ShipIDs[p.ID]
+		if shipID == 0 { continue }
+		if _, alreadyDone := sess.ShipIDs[p.ID]; !alreadyDone { continue }
+
+		// Mark ship destroyed
+		s.db.ExecContext(ctx, `UPDATE ships SET is_destroyed=true, is_active=false WHERE id=$1`, shipID)
+
+		// Get system for wreck
+		var systemID int64
+		s.db.GetContext(ctx, &systemID, `SELECT current_system_id FROM characters WHERE id=$1`, p.ID)
+
+		// Get ship def info
+		var shipDefID int64
+		var shipName string
+		s.db.QueryRowContext(ctx, `SELECT ship_def_id, name FROM ships WHERE id=$1`, shipID).Scan(&shipDefID, &shipName)
+
+		// Create wreck
+		var wreckID int64
+		s.db.QueryRowContext(ctx,
+			`INSERT INTO wrecks (system_id, owner_name, ship_def_id, ship_name) VALUES ($1,$2,$3,$4) RETURNING id`,
+			systemID, p.Name, shipDefID, shipName).Scan(&wreckID)
+
+		// 50% chance each fitting drops into wreck
+		type FitRow struct {
+			ItemDefID int64 `db:"module_item_id"`
+		}
+		var fittings []FitRow
+		s.db.SelectContext(ctx, &fittings, `SELECT module_item_id FROM ship_fittings WHERE ship_id=$1`, shipID)
+		dropped := 0
+		for _, f := range fittings {
+			if rand.Float64() < 0.5 {
+				s.db.ExecContext(ctx, `INSERT INTO wreck_items (wreck_id, item_def_id, quantity) VALUES ($1,$2,1)`, wreckID, f.ItemDefID)
+				dropped++
+			}
+		}
+
+		// Remove all fittings from destroyed ship
+		s.db.ExecContext(ctx, `DELETE FROM ship_fittings WHERE ship_id=$1`, shipID)
+
+		// Remove from ShipIDs so we don't process again
+		delete(sess.ShipIDs, p.ID)
+
+		sess.Engine.State.Logs = append(sess.Engine.State.Logs,
+			fmt.Sprintf("  ▸ %s 的舰船变为残骸(掉落%d件装备)", p.Name, dropped))
+	}
+
 	if !playerAlive {
 		result.Failed = true
 		s.db.ExecContext(ctx, `UPDATE dungeon_instances SET status='failed', completed_at=NOW() WHERE id=$1`, sess.InstID)
 		s.db.ExecContext(ctx, `UPDATE combat_sites SET status='active', occupied_by=0 WHERE id=$1`, sess.SiteID)
-		delete(s.sessions, charID)
-		sess.Engine.State.Logs = append(sess.Engine.State.Logs, "你的舰船被击毁！")
+		for _, mid := range members { delete(s.sessions, mid) }
+		sess.Engine.State.Logs = append(sess.Engine.State.Logs, "舰队全灭！")
 		return result, nil
 	}
 
+	// Distribute bounty to all surviving members
 	bounty := sess.NPCBounty * int64(kills)
-	s.db.ExecContext(ctx, `UPDATE characters SET balance=balance+$1 WHERE id=$2`, bounty, charID)
+	sharePerMember := bounty / int64(len(members))
+	for _, mid := range members {
+		s.db.ExecContext(ctx, `UPDATE characters SET balance=balance+$1 WHERE id=$2`, sharePerMember, mid)
+	}
 	sess.Engine.State.Logs = append(sess.Engine.State.Logs,
-		fmt.Sprintf("▸ 第%d波清除! 击杀%d, 赏金+%d星币", sess.Wave, kills, bounty))
+		fmt.Sprintf("▸ 第%d波清除! 击杀%d, 赏金+%d星币(每人%d)", sess.Wave, kills, bounty, sharePerMember))
 
 	if sess.Wave >= sess.TotalWaves {
 		result.Completed = true
 		var reward int64
 		s.db.GetContext(ctx, &reward, `SELECT reward_credits FROM dungeon_defs WHERE id=$1`, sess.DungeonID)
-		s.db.ExecContext(ctx, `UPDATE characters SET balance=balance+$1 WHERE id=$2`, reward, charID)
+		rewardPerMember := reward / int64(len(members))
+		for _, mid := range members {
+			s.db.ExecContext(ctx, `UPDATE characters SET balance=balance+$1 WHERE id=$2`, rewardPerMember, mid)
+		}
 		s.db.ExecContext(ctx, `UPDATE dungeon_instances SET status='completed', completed_at=NOW() WHERE id=$1`, sess.InstID)
 		s.db.ExecContext(ctx, `UPDATE combat_sites SET status='cooldown', completed_at=NOW(), cooldown_until=$1 WHERE id=$2`,
 			time.Now().Add(20*time.Minute), sess.SiteID)
 
-		var systemID int64
-		s.db.GetContext(ctx, &systemID, `SELECT current_system_id FROM characters WHERE id=$1`, charID)
-		oreIDs := []int64{1001, 1002, 1003, 1005, 1006, 1008}
-		for j := 0; j < 1+rand.Intn(3); j++ {
-			itemID := oreIDs[rand.Intn(len(oreIDs))]
-			qty := int64(10 + rand.Intn(50))
-			s.invRepo.AddOrUpsertItem(ctx, "character", charID, itemID, qty, systemID)
-			def, _ := s.invRepo.GetItemDef(ctx, itemID)
+		// Loot: scale by difficulty - better items for harder content
+		var difficulty int
+		s.db.GetContext(ctx, &difficulty, `SELECT difficulty FROM dungeon_defs WHERE id=$1`, sess.DungeonID)
+
+		// Choose loot pool based on difficulty
+		type LootItem struct {
+			ID  int64
+			Qty int64
+		}
+		var lootPool []LootItem
+		if difficulty >= 8 {
+			// T8+ drops modules and high-value salvage
+			modIDs := []int64{5163, 5152, 5171, 8005, 8024, 5451, 8132, 8101, 5302}
+			for j := 0; j < 2+rand.Intn(4); j++ {
+				lootPool = append(lootPool, LootItem{modIDs[rand.Intn(len(modIDs))], 1})
+			}
+			// Plus some minerals
+			mineralIDs := []int64{1005, 1006, 1008}
+			for j := 0; j < 1+rand.Intn(2); j++ {
+				lootPool = append(lootPool, LootItem{mineralIDs[rand.Intn(len(mineralIDs))], int64(50 + rand.Intn(200))})
+			}
+		} else if difficulty >= 5 {
+			modIDs := []int64{5112, 5102, 5121, 8004, 8029, 5315, 5306}
+			for j := 0; j < 1+rand.Intn(3); j++ {
+				lootPool = append(lootPool, LootItem{modIDs[rand.Intn(len(modIDs))], 1})
+			}
+			mineralIDs := []int64{1003, 1005, 1006}
+			for j := 0; j < 1+rand.Intn(3); j++ {
+				lootPool = append(lootPool, LootItem{mineralIDs[rand.Intn(len(mineralIDs))], int64(30 + rand.Intn(100))})
+			}
+		} else {
+			oreIDs := []int64{1001, 1002, 1003, 1005, 1006, 1008}
+			for j := 0; j < 1+rand.Intn(3); j++ {
+				lootPool = append(lootPool, LootItem{oreIDs[rand.Intn(len(oreIDs))], int64(10 + rand.Intn(50))})
+			}
+		}
+
+		// Distribute loot: each member gets the same loot
+		for _, mid := range members {
+			var systemID int64
+			s.db.GetContext(ctx, &systemID, `SELECT current_system_id FROM characters WHERE id=$1`, mid)
+			for _, item := range lootPool {
+				s.invRepo.AddOrUpsertItem(ctx, "character", mid, item.ID, item.Qty, systemID)
+			}
+		}
+		// Show loot once (not per-member)
+		for _, item := range lootPool {
+			def, _ := s.invRepo.GetItemDef(ctx, item.ID)
 			n := "物品"
 			if def != nil { n = def.Name }
-			result.Rewards = append(result.Rewards, fmt.Sprintf("%s x%d", n, qty))
+			result.Rewards = append(result.Rewards, fmt.Sprintf("%s x%d", n, item.Qty))
 		}
+
 		sess.Engine.State.Logs = append(sess.Engine.State.Logs,
 			"═══ 地点通关! ═══",
-			fmt.Sprintf("▸ 通关奖励: +%d 星币", reward))
+			fmt.Sprintf("▸ 通关奖励: 每人+%d 星币", rewardPerMember))
 		for _, r := range result.Rewards {
 			sess.Engine.State.Logs = append(sess.Engine.State.Logs, "▸ 战利品: "+r)
 		}
-		delete(s.sessions, charID)
+		for _, mid := range members { delete(s.sessions, mid) }
 	} else {
-		// 进入下一波
 		sess.Wave++
 		s.db.ExecContext(ctx, `UPDATE dungeon_instances SET current_wave=$1 WHERE id=$2`, sess.Wave, sess.InstID)
-		newSess := s.initWaveCombat(ctx, charID, sess.DungeonID, sess.Wave)
+		newSess := s.initWaveCombatFleet(ctx, members, sess.DungeonID, sess.Wave)
 		newSess.SiteID = sess.SiteID
 		newSess.InstID = sess.InstID
 		newSess.DungeonID = sess.DungeonID
 		newSess.TotalWaves = sess.TotalWaves
+		newSess.FleetID = sess.FleetID
+		newSess.MemberIDs = members
 
-		// 保留上一波的日志
 		prevLogs := sess.Engine.State.Logs
 		newSess.Engine.State.Logs = append(prevLogs, fmt.Sprintf("── 第%d波开始 ── %s", newSess.Wave, newSess.WaveText))
-		s.sessions[charID] = newSess
+		for _, mid := range members { s.sessions[mid] = newSess }
 
 		result.WaveNumber = newSess.Wave
 		result.WaveText = newSess.WaveText
@@ -481,60 +614,90 @@ func (s *CombatSiteService) initWaveCombat(ctx context.Context, charID, dungeonD
 	pp := model.CombatParticipant{
 		ID: charID, Name: "你", Type: "player", Team: "a",
 		ShieldCurrent: 2000, ShieldMax: 2000, ArmorCurrent: 1500, ArmorMax: 1500,
-		StructureCurrent: 1000, StructureMax: 1000, CapCurrent: 500, Distance: 20000,
+		StructureCurrent: 1000, StructureMax: 1000, CapCurrent: 500, CapMax: 500, Distance: 20000,
 		DamagePerTick: 0, DamageType: model.DamageKinetic, RateOfFire: 1,
 		ShieldRecharge: 30, Speed: 300, Signature: 100, OptimalRange: 15000,
 		ShieldResist: model.ResistProfile{Kinetic: 0.15, Thermal: 0.40, EM: 0.30, Explosive: 0.10},
 		ArmorResist:  model.ResistProfile{Kinetic: 0.40, Thermal: 0.20, EM: 0.10, Explosive: 0.30},
 	}
-	// 加载舰船属性
 	var shipInfo struct {
-		ShipID int64 `db:"ship_id"`
-		SHP    int   `db:"shield_hp"`
-		AHP    int   `db:"armor_hp"`
-		HHP    int   `db:"structure_hp"`
-		Spd    int   `db:"max_speed"`
-		Sig    int   `db:"signature"`
-		SRch   int   `db:"shield_recharge"`
+		ShipID         int64   `db:"ship_id"`
+		SHP            int     `db:"shield_hp"`
+		AHP            int     `db:"armor_hp"`
+		HHP            int     `db:"structure_hp"`
+		Spd            int     `db:"max_speed"`
+		Sig            int     `db:"signature"`
+		SRch           int     `db:"shield_recharge"`
+		Cap            int     `db:"capacitor"`
+		CapRch         int     `db:"cap_recharge"`
+		SResK          float64 `db:"shield_res_kinetic"`
+		SResT          float64 `db:"shield_res_thermal"`
+		SResE          float64 `db:"shield_res_em"`
+		SResX          float64 `db:"shield_res_explosive"`
+		AResK          float64 `db:"armor_res_kinetic"`
+		AResT          float64 `db:"armor_res_thermal"`
+		AResE          float64 `db:"armor_res_em"`
+		AResX          float64 `db:"armor_res_explosive"`
 	}
 	if s.db.GetContext(ctx, &shipInfo,
-		`SELECT sh.id as ship_id, sd.shield_hp,sd.armor_hp,sd.structure_hp,sd.max_speed,sd.signature,sd.shield_recharge
+		`SELECT sh.id as ship_id, sd.shield_hp,sd.armor_hp,sd.structure_hp,sd.max_speed,sd.signature,sd.shield_recharge,
+		 sd.capacitor,sd.cap_recharge,
+		 sd.shield_res_kinetic,sd.shield_res_thermal,sd.shield_res_em,sd.shield_res_explosive,
+		 sd.armor_res_kinetic,sd.armor_res_thermal,sd.armor_res_em,sd.armor_res_explosive
 		 FROM ship_defs sd JOIN ships sh ON sh.ship_def_id=sd.id WHERE sh.character_id=$1 AND sh.is_active=true LIMIT 1`, charID) == nil {
 		pp.ShieldCurrent, pp.ShieldMax = shipInfo.SHP, shipInfo.SHP
 		pp.ArmorCurrent, pp.ArmorMax = shipInfo.AHP, shipInfo.AHP
 		pp.StructureCurrent, pp.StructureMax = shipInfo.HHP, shipInfo.HHP
 		pp.Speed, pp.Signature = shipInfo.Spd, shipInfo.Sig
 		pp.ShieldRecharge = shipInfo.SRch
+		pp.CapCurrent, pp.CapMax = shipInfo.Cap, shipInfo.Cap
+		pp.CapRecharge = shipInfo.CapRch
+		pp.ShieldResist = model.ResistProfile{Kinetic: shipInfo.SResK, Thermal: shipInfo.SResT, EM: shipInfo.SResE, Explosive: shipInfo.SResX}
+		pp.ArmorResist = model.ResistProfile{Kinetic: shipInfo.AResK, Thermal: shipInfo.AResT, EM: shipInfo.AResE, Explosive: shipInfo.AResX}
 
-		// 读取装配的武器
+		// High slot weapons
 		type WeaponRow struct {
-			DPT     int    `db:"damage_per_tick"`
-			DmgType string `db:"damage_type"`
-			ROF     int    `db:"rate_of_fire"`
-			OptRng  int    `db:"optimal_range"`
+			DPT      int     `db:"damage_per_tick"`
+			DmgType  string  `db:"damage_type"`
+			ROF      int     `db:"rate_of_fire"`
+			OptRng   int     `db:"optimal_range"`
+			Falloff  int     `db:"falloff_range"`
+			Tracking float64 `db:"tracking_speed"`
+			CapCost  int     `db:"cap_cost"`
 		}
 		var weapons []WeaponRow
 		s.db.SelectContext(ctx, &weapons,
 			`SELECT COALESCE(i.damage_per_tick,0) as damage_per_tick,
 			  COALESCE(i.damage_type,'kinetic') as damage_type,
 			  COALESCE(i.rate_of_fire,1) as rate_of_fire,
-			  COALESCE(i.optimal_range,15000) as optimal_range
+			  COALESCE(i.optimal_range,15000) as optimal_range,
+			  COALESCE(i.falloff_range,0) as falloff_range,
+			  COALESCE(i.tracking_speed,0) as tracking_speed,
+			  COALESCE(i.cap_cost,0) as cap_cost
 			 FROM ship_fittings sf JOIN item_defs i ON i.id=sf.module_item_id
 			 WHERE sf.ship_id=$1 AND sf.slot_type='high' AND COALESCE(i.damage_per_tick,0)>0`, shipInfo.ShipID)
 
 		if len(weapons) > 0 {
-			totalDPS := 0
-			bestRange := 0
+			totalDPS, totalCapCost, bestRange, bestFalloff := 0, 0, 0, 0
+			var bestTracking float64
 			dmgCounts := map[string]int{}
 			for _, w := range weapons {
 				rof := w.ROF
 				if rof <= 0 { rof = 1 }
 				totalDPS += w.DPT / rof
+				totalCapCost += w.CapCost / rof
 				if w.OptRng > bestRange { bestRange = w.OptRng }
+				if w.Falloff > bestFalloff { bestFalloff = w.Falloff }
+				if w.Tracking > 0 && (bestTracking == 0 || w.Tracking < bestTracking) {
+					bestTracking = w.Tracking
+				}
 				dmgCounts[w.DmgType]++
 			}
 			pp.DamagePerTick = totalDPS
 			pp.OptimalRange = bestRange
+			pp.FalloffRange = bestFalloff
+			pp.TrackingSpeed = bestTracking
+			pp.CapCost = totalCapCost
 			bestType, bestCount := "kinetic", 0
 			for t, c := range dmgCounts {
 				if c > bestCount { bestType = t; bestCount = c }
@@ -542,6 +705,90 @@ func (s *CombatSiteService) initWaveCombat(ctx context.Context, charID, dungeonD
 			pp.DamageType = model.DamageType(bestType)
 			pp.WeaponName = fmt.Sprintf("%d门武器", len(weapons))
 		}
+
+		// Mid/low slot module effects
+		type ModEffect struct {
+			BonusType  string  `db:"bonus_type"`
+			BonusValue float64 `db:"bonus_value"`
+		}
+		var effects []ModEffect
+		s.db.SelectContext(ctx, &effects,
+			`SELECT COALESCE(i.bonus_type,'') as bonus_type, COALESCE(i.bonus_value,0) as bonus_value
+			 FROM ship_fittings sf JOIN item_defs i ON i.id=sf.module_item_id
+			 WHERE sf.ship_id=$1 AND sf.slot_type IN ('mid','low') AND COALESCE(i.bonus_type,'') != ''`, shipInfo.ShipID)
+
+		for _, e := range effects {
+			switch e.BonusType {
+			case "shield_boost":
+				pp.ShieldRecharge += int(e.BonusValue)
+			case "shield_hp_bonus":
+				bonus := int(float64(pp.ShieldMax) * e.BonusValue)
+				pp.ShieldMax += bonus
+				pp.ShieldCurrent += bonus
+			case "armor_repair":
+				pp.ArmorRepair += int(e.BonusValue)
+			case "armor_hp":
+				pp.ArmorMax += int(e.BonusValue)
+				pp.ArmorCurrent += int(e.BonusValue)
+			case "armor_kinetic_resist":
+				pp.ArmorResist.Kinetic += e.BonusValue
+			case "armor_thermal_resist":
+				pp.ArmorResist.Thermal += e.BonusValue
+			case "armor_em_resist":
+				pp.ArmorResist.EM += e.BonusValue
+			case "armor_explosive_resist":
+				pp.ArmorResist.Explosive += e.BonusValue
+			case "armor_omni_resist":
+				pp.ArmorResist.Kinetic += e.BonusValue
+				pp.ArmorResist.Thermal += e.BonusValue
+				pp.ArmorResist.EM += e.BonusValue
+				pp.ArmorResist.Explosive += e.BonusValue
+			case "shield_kinetic_resist":
+				pp.ShieldResist.Kinetic += e.BonusValue
+			case "shield_thermal_resist":
+				pp.ShieldResist.Thermal += e.BonusValue
+			case "shield_em_resist":
+				pp.ShieldResist.EM += e.BonusValue
+			case "shield_explosive_resist":
+				pp.ShieldResist.Explosive += e.BonusValue
+			case "shield_omni_resist":
+				pp.ShieldResist.Kinetic += e.BonusValue
+				pp.ShieldResist.Thermal += e.BonusValue
+				pp.ShieldResist.EM += e.BonusValue
+				pp.ShieldResist.Explosive += e.BonusValue
+			case "all_resist":
+				pp.ShieldResist.Kinetic += e.BonusValue
+				pp.ShieldResist.Thermal += e.BonusValue
+				pp.ShieldResist.EM += e.BonusValue
+				pp.ShieldResist.Explosive += e.BonusValue
+				pp.ArmorResist.Kinetic += e.BonusValue
+				pp.ArmorResist.Thermal += e.BonusValue
+				pp.ArmorResist.EM += e.BonusValue
+				pp.ArmorResist.Explosive += e.BonusValue
+			case "speed_bonus":
+				pp.Speed += int(float64(pp.Speed) * e.BonusValue)
+			case "cap_boost":
+				pp.CapMax += int(e.BonusValue)
+				pp.CapCurrent += int(e.BonusValue)
+			case "cap_recharge_bonus":
+				pp.CapRecharge += int(float64(pp.CapRecharge) * e.BonusValue)
+			case "tracking_bonus":
+				pp.TrackingSpeed *= (1.0 + e.BonusValue)
+			case "signature_reduction":
+				pp.Signature -= int(float64(pp.Signature) * e.BonusValue)
+				if pp.Signature < 10 { pp.Signature = 10 }
+			}
+		}
+
+		// Clamp resists to 0.85 max
+		clampResist := func(r *model.ResistProfile) {
+			if r.Kinetic > 0.85 { r.Kinetic = 0.85 }
+			if r.Thermal > 0.85 { r.Thermal = 0.85 }
+			if r.EM > 0.85 { r.EM = 0.85 }
+			if r.Explosive > 0.85 { r.Explosive = 0.85 }
+		}
+		clampResist(&pp.ShieldResist)
+		clampResist(&pp.ArmorResist)
 	}
 	eng.AddParticipant(pp)
 
@@ -572,10 +819,190 @@ func (s *CombatSiteService) initWaveCombat(ctx context.Context, charID, dungeonD
 	}
 }
 
-// LeaveSite 离开当前地点
+// initWaveCombatFleet creates a wave combat with multiple player ships
+func (s *CombatSiteService) initWaveCombatFleet(ctx context.Context, charIDs []int64, dungeonDefID int64, wave int) *siteSession {
+	if len(charIDs) == 1 {
+		return s.initWaveCombat(ctx, charIDs[0], dungeonDefID, wave)
+	}
+
+	// Use the single-player version to get wave data and NPC setup
+	baseSess := s.initWaveCombat(ctx, charIDs[0], dungeonDefID, wave)
+
+	// Add remaining fleet members as additional team "a" participants
+	for idx := 1; idx < len(charIDs); idx++ {
+		cid := charIDs[idx]
+		pp := s.buildPlayerParticipant(ctx, cid)
+		pp.ID = cid
+		baseSess.Engine.AddParticipant(pp)
+	}
+
+	return baseSess
+}
+
+// buildPlayerParticipant creates a CombatParticipant from a character's active ship
+func (s *CombatSiteService) buildPlayerParticipant(ctx context.Context, charID int64) model.CombatParticipant {
+	var charName string
+	s.db.GetContext(ctx, &charName, `SELECT name FROM characters WHERE id=$1`, charID)
+
+	pp := model.CombatParticipant{
+		ID: charID, Name: charName, Type: "player", Team: "a",
+		ShieldCurrent: 2000, ShieldMax: 2000, ArmorCurrent: 1500, ArmorMax: 1500,
+		StructureCurrent: 1000, StructureMax: 1000, CapCurrent: 500, CapMax: 500, Distance: 20000,
+		DamagePerTick: 0, DamageType: model.DamageKinetic, RateOfFire: 1,
+		ShieldRecharge: 30, Speed: 300, Signature: 100, OptimalRange: 15000,
+		ShieldResist: model.ResistProfile{Kinetic: 0.15, Thermal: 0.40, EM: 0.30, Explosive: 0.10},
+		ArmorResist:  model.ResistProfile{Kinetic: 0.40, Thermal: 0.20, EM: 0.10, Explosive: 0.30},
+	}
+
+	var shipInfo struct {
+		ShipID int64   `db:"ship_id"`
+		SHP    int     `db:"shield_hp"`
+		AHP    int     `db:"armor_hp"`
+		HHP    int     `db:"structure_hp"`
+		Spd    int     `db:"max_speed"`
+		Sig    int     `db:"signature"`
+		SRch   int     `db:"shield_recharge"`
+		Cap    int     `db:"capacitor"`
+		CapRch int     `db:"cap_recharge"`
+		SResK  float64 `db:"shield_res_kinetic"`
+		SResT  float64 `db:"shield_res_thermal"`
+		SResE  float64 `db:"shield_res_em"`
+		SResX  float64 `db:"shield_res_explosive"`
+		AResK  float64 `db:"armor_res_kinetic"`
+		AResT  float64 `db:"armor_res_thermal"`
+		AResE  float64 `db:"armor_res_em"`
+		AResX  float64 `db:"armor_res_explosive"`
+	}
+	if s.db.GetContext(ctx, &shipInfo,
+		`SELECT sh.id as ship_id, sd.shield_hp,sd.armor_hp,sd.structure_hp,sd.max_speed,sd.signature,sd.shield_recharge,
+		 sd.capacitor,sd.cap_recharge,
+		 sd.shield_res_kinetic,sd.shield_res_thermal,sd.shield_res_em,sd.shield_res_explosive,
+		 sd.armor_res_kinetic,sd.armor_res_thermal,sd.armor_res_em,sd.armor_res_explosive
+		 FROM ship_defs sd JOIN ships sh ON sh.ship_def_id=sd.id WHERE sh.character_id=$1 AND sh.is_active=true LIMIT 1`, charID) == nil {
+		pp.ShieldCurrent, pp.ShieldMax = shipInfo.SHP, shipInfo.SHP
+		pp.ArmorCurrent, pp.ArmorMax = shipInfo.AHP, shipInfo.AHP
+		pp.StructureCurrent, pp.StructureMax = shipInfo.HHP, shipInfo.HHP
+		pp.Speed, pp.Signature = shipInfo.Spd, shipInfo.Sig
+		pp.ShieldRecharge = shipInfo.SRch
+		pp.CapCurrent, pp.CapMax = shipInfo.Cap, shipInfo.Cap
+		pp.CapRecharge = shipInfo.CapRch
+		pp.ShieldResist = model.ResistProfile{Kinetic: shipInfo.SResK, Thermal: shipInfo.SResT, EM: shipInfo.SResE, Explosive: shipInfo.SResX}
+		pp.ArmorResist = model.ResistProfile{Kinetic: shipInfo.AResK, Thermal: shipInfo.AResT, EM: shipInfo.AResE, Explosive: shipInfo.AResX}
+
+		// Weapons
+		type WeaponRow struct {
+			DPT      int     `db:"damage_per_tick"`
+			DmgType  string  `db:"damage_type"`
+			ROF      int     `db:"rate_of_fire"`
+			OptRng   int     `db:"optimal_range"`
+			Falloff  int     `db:"falloff_range"`
+			Tracking float64 `db:"tracking_speed"`
+			CapCost  int     `db:"cap_cost"`
+		}
+		var weapons []WeaponRow
+		s.db.SelectContext(ctx, &weapons,
+			`SELECT COALESCE(i.damage_per_tick,0) as damage_per_tick,
+			  COALESCE(i.damage_type,'kinetic') as damage_type,
+			  COALESCE(i.rate_of_fire,1) as rate_of_fire,
+			  COALESCE(i.optimal_range,15000) as optimal_range,
+			  COALESCE(i.falloff_range,0) as falloff_range,
+			  COALESCE(i.tracking_speed,0) as tracking_speed,
+			  COALESCE(i.cap_cost,0) as cap_cost
+			 FROM ship_fittings sf JOIN item_defs i ON i.id=sf.module_item_id
+			 WHERE sf.ship_id=$1 AND sf.slot_type='high' AND COALESCE(i.damage_per_tick,0)>0`, shipInfo.ShipID)
+
+		if len(weapons) > 0 {
+			totalDPS, totalCapCost, bestRange, bestFalloff := 0, 0, 0, 0
+			var bestTracking float64
+			dmgCounts := map[string]int{}
+			for _, w := range weapons {
+				rof := w.ROF; if rof <= 0 { rof = 1 }
+				totalDPS += w.DPT / rof
+				totalCapCost += w.CapCost / rof
+				if w.OptRng > bestRange { bestRange = w.OptRng }
+				if w.Falloff > bestFalloff { bestFalloff = w.Falloff }
+				if w.Tracking > 0 && (bestTracking == 0 || w.Tracking < bestTracking) { bestTracking = w.Tracking }
+				dmgCounts[w.DmgType]++
+			}
+			pp.DamagePerTick = totalDPS
+			pp.OptimalRange = bestRange
+			pp.FalloffRange = bestFalloff
+			pp.TrackingSpeed = bestTracking
+			pp.CapCost = totalCapCost
+			bestType, bestCount := "kinetic", 0
+			for t, c := range dmgCounts { if c > bestCount { bestType = t; bestCount = c } }
+			pp.DamageType = model.DamageType(bestType)
+			pp.WeaponName = fmt.Sprintf("%d门武器", len(weapons))
+		}
+
+		// Module effects
+		type ModEffect struct {
+			BonusType  string  `db:"bonus_type"`
+			BonusValue float64 `db:"bonus_value"`
+		}
+		var effects []ModEffect
+		s.db.SelectContext(ctx, &effects,
+			`SELECT COALESCE(i.bonus_type,'') as bonus_type, COALESCE(i.bonus_value,0) as bonus_value
+			 FROM ship_fittings sf JOIN item_defs i ON i.id=sf.module_item_id
+			 WHERE sf.ship_id=$1 AND sf.slot_type IN ('mid','low') AND COALESCE(i.bonus_type,'') != ''`, shipInfo.ShipID)
+
+		for _, e := range effects {
+			switch e.BonusType {
+			case "shield_boost": pp.ShieldRecharge += int(e.BonusValue)
+			case "shield_hp_bonus":
+				bonus := int(float64(pp.ShieldMax) * e.BonusValue)
+				pp.ShieldMax += bonus; pp.ShieldCurrent += bonus
+			case "armor_repair": pp.ArmorRepair += int(e.BonusValue)
+			case "armor_hp": pp.ArmorMax += int(e.BonusValue); pp.ArmorCurrent += int(e.BonusValue)
+			case "armor_kinetic_resist": pp.ArmorResist.Kinetic += e.BonusValue
+			case "armor_thermal_resist": pp.ArmorResist.Thermal += e.BonusValue
+			case "armor_em_resist": pp.ArmorResist.EM += e.BonusValue
+			case "armor_explosive_resist": pp.ArmorResist.Explosive += e.BonusValue
+			case "armor_omni_resist":
+				pp.ArmorResist.Kinetic += e.BonusValue; pp.ArmorResist.Thermal += e.BonusValue
+				pp.ArmorResist.EM += e.BonusValue; pp.ArmorResist.Explosive += e.BonusValue
+			case "shield_kinetic_resist": pp.ShieldResist.Kinetic += e.BonusValue
+			case "shield_thermal_resist": pp.ShieldResist.Thermal += e.BonusValue
+			case "shield_em_resist": pp.ShieldResist.EM += e.BonusValue
+			case "shield_explosive_resist": pp.ShieldResist.Explosive += e.BonusValue
+			case "shield_omni_resist":
+				pp.ShieldResist.Kinetic += e.BonusValue; pp.ShieldResist.Thermal += e.BonusValue
+				pp.ShieldResist.EM += e.BonusValue; pp.ShieldResist.Explosive += e.BonusValue
+			case "all_resist":
+				pp.ShieldResist.Kinetic += e.BonusValue; pp.ShieldResist.Thermal += e.BonusValue
+				pp.ShieldResist.EM += e.BonusValue; pp.ShieldResist.Explosive += e.BonusValue
+				pp.ArmorResist.Kinetic += e.BonusValue; pp.ArmorResist.Thermal += e.BonusValue
+				pp.ArmorResist.EM += e.BonusValue; pp.ArmorResist.Explosive += e.BonusValue
+			case "speed_bonus": pp.Speed += int(float64(pp.Speed) * e.BonusValue)
+			case "cap_boost": pp.CapMax += int(e.BonusValue); pp.CapCurrent += int(e.BonusValue)
+			case "cap_recharge_bonus": pp.CapRecharge += int(float64(pp.CapRecharge) * e.BonusValue)
+			case "tracking_bonus": pp.TrackingSpeed *= (1.0 + e.BonusValue)
+			case "signature_reduction":
+				pp.Signature -= int(float64(pp.Signature) * e.BonusValue)
+				if pp.Signature < 10 { pp.Signature = 10 }
+			}
+		}
+		clamp := func(r *model.ResistProfile) {
+			if r.Kinetic > 0.85 { r.Kinetic = 0.85 }; if r.Thermal > 0.85 { r.Thermal = 0.85 }
+			if r.EM > 0.85 { r.EM = 0.85 }; if r.Explosive > 0.85 { r.Explosive = 0.85 }
+		}
+		clamp(&pp.ShieldResist); clamp(&pp.ArmorResist)
+	}
+	return pp
+}
+
+// LeaveSite 离开当前地点（支持舰队）
 func (s *CombatSiteService) LeaveSite(ctx context.Context, charID int64) error {
 	s.mu.Lock()
-	delete(s.sessions, charID)
+	sess, ok := s.sessions[charID]
+	if ok && len(sess.MemberIDs) > 1 {
+		// Fleet: clean up all members
+		for _, mid := range sess.MemberIDs {
+			delete(s.sessions, mid)
+		}
+	} else {
+		delete(s.sessions, charID)
+	}
 	s.mu.Unlock()
 	s.db.ExecContext(ctx, `UPDATE dungeon_instances SET status='abandoned', completed_at=NOW() WHERE character_id=$1 AND status='running'`, charID)
 	s.db.ExecContext(ctx, `UPDATE combat_sites SET status='active', occupied_by=0 WHERE occupied_by=$1`, charID)

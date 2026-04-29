@@ -64,30 +64,36 @@ type ResistProfile struct {
 }
 
 type CombatParticipant struct {
-	ID              int64  `json:"id"`
-	Name            string `json:"name"`
-	Type            string `json:"type"` // player / npc
-	Team            string `json:"team"`
-	ShieldCurrent   int    `json:"shield_current"`
-	ShieldMax       int    `json:"shield_max"`
-	ArmorCurrent    int    `json:"armor_current"`
-	ArmorMax        int    `json:"armor_max"`
-	StructureCurrent int   `json:"structure_current"`
-	StructureMax    int    `json:"structure_max"`
-	CapCurrent      int    `json:"cap_current"`
-	Distance        int    `json:"distance"`
-	IsDestroyed     bool   `json:"is_destroyed"`
-	TargetID        *int64 `json:"target_id,omitempty"`
-	DamagePerTick   int    `json:"damage_per_tick"`
-	DamageType      DamageType `json:"damage_type"`
-	RateOfFire      int    `json:"rate_of_fire"`
-	WeaponName      string `json:"weapon_name,omitempty"`
-	ShieldRecharge  int    `json:"shield_recharge"`
-	Speed           int    `json:"speed"`
-	Signature       int    `json:"signature"`
-	OptimalRange    int    `json:"optimal_range"`
-	ShieldResist    ResistProfile `json:"shield_resist"`
-	ArmorResist     ResistProfile `json:"armor_resist"`
+	ID               int64      `json:"id"`
+	Name             string     `json:"name"`
+	Type             string     `json:"type"` // player / npc
+	Team             string     `json:"team"`
+	ShieldCurrent    int        `json:"shield_current"`
+	ShieldMax        int        `json:"shield_max"`
+	ArmorCurrent     int        `json:"armor_current"`
+	ArmorMax         int        `json:"armor_max"`
+	StructureCurrent int        `json:"structure_current"`
+	StructureMax     int        `json:"structure_max"`
+	CapCurrent       int        `json:"cap_current"`
+	CapMax           int        `json:"cap_max"`
+	CapRecharge      int        `json:"cap_recharge"`
+	Distance         int        `json:"distance"`
+	IsDestroyed      bool       `json:"is_destroyed"`
+	TargetID         *int64     `json:"target_id,omitempty"`
+	DamagePerTick    int        `json:"damage_per_tick"`
+	DamageType       DamageType `json:"damage_type"`
+	RateOfFire       int        `json:"rate_of_fire"`
+	WeaponName       string     `json:"weapon_name,omitempty"`
+	TrackingSpeed    float64    `json:"tracking_speed"`
+	FalloffRange     int        `json:"falloff_range"`
+	CapCost          int        `json:"cap_cost"`
+	ShieldRecharge   int        `json:"shield_recharge"`
+	ArmorRepair      int        `json:"armor_repair"`
+	Speed            int        `json:"speed"`
+	Signature        int        `json:"signature"`
+	OptimalRange     int        `json:"optimal_range"`
+	ShieldResist     ResistProfile `json:"shield_resist"`
+	ArmorResist      ResistProfile `json:"armor_resist"`
 }
 
 type CombatState struct {

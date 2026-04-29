@@ -22,13 +22,16 @@ var (
 )
 
 type DungeonService struct {
-	db      *sqlx.DB
-	invRepo *repository.InventoryRepo
+	db       *sqlx.DB
+	invRepo  *repository.InventoryRepo
+	fleetSvc *FleetService
 }
 
 func NewDungeonService(db *sqlx.DB, invRepo *repository.InventoryRepo) *DungeonService {
 	return &DungeonService{db: db, invRepo: invRepo}
 }
+
+func (s *DungeonService) SetFleetService(fs *FleetService) { s.fleetSvc = fs }
 
 type DungeonBrief struct {
 	ID          int64  `db:"id" json:"id"`
@@ -78,6 +81,13 @@ func (s *DungeonService) ListDungeons(ctx context.Context, raceTheme, difficulty
 }
 
 func (s *DungeonService) Enter(ctx context.Context, charID, dungeonDefID int64) (*WaveInfo, error) {
+	if s.fleetSvc != nil {
+		inFleet, _, _ := s.fleetSvc.IsInFleet(ctx, charID)
+		if inFleet {
+			return nil, errors.New("你在舰队中，请通过战斗地点组队作战")
+		}
+	}
+
 	var active int
 	s.db.GetContext(ctx, &active, `SELECT COUNT(*) FROM dungeon_instances WHERE character_id=$1 AND status='running'`, charID)
 	if active > 0 {

@@ -20,6 +20,9 @@ func SetupRouter(
 	shipHandler *ShipHandler,
 	dungeonHandler *DungeonHandler,
 	combatSiteHandler *CombatSiteHandler,
+	combatSiteWS *CombatSiteWS,
+	fleetHandler *FleetHandler,
+	wreckHandler *WreckHandler,
 ) *gin.Engine {
 	if mode == "release" {
 		gin.SetMode(gin.ReleaseMode)
@@ -172,6 +175,23 @@ func SetupRouter(
 			sites.POST("/leave", combatSiteHandler.Leave)
 		}
 
+		// 残骸
+		authed.GET("/wrecks", wreckHandler.ListWrecks)
+		authed.POST("/wrecks/:id/loot", wreckHandler.LootWreck)
+
+		// 舰队
+		fleet := authed.Group("/fleet")
+		{
+			fleet.POST("/create", fleetHandler.Create)
+			fleet.POST("/invite", fleetHandler.Invite)
+			fleet.POST("/accept", fleetHandler.Accept)
+			fleet.POST("/decline", fleetHandler.Decline)
+			fleet.POST("/leave", fleetHandler.Leave)
+			fleet.POST("/kick", fleetHandler.Kick)
+			fleet.POST("/disband", fleetHandler.Disband)
+			fleet.GET("", fleetHandler.GetFleet)
+		}
+
 		// 远征
 		dng := authed.Group("/dungeons")
 		{
@@ -182,6 +202,9 @@ func SetupRouter(
 			dng.POST("/leave", dungeonHandler.Leave)
 		}
 	}
+
+	// WebSocket (auth handled inside handler)
+	r.GET("/ws/sites", gin.WrapH(combatSiteWS.Handler()))
 
 	// 公开API
 	api.GET("/items", economyHandler.GetItemDefs)

@@ -22,14 +22,27 @@ const (
 )
 
 type ItemDef struct {
-	ID          int64        `db:"id" json:"id"`
-	Name        string       `db:"name" json:"name"`
-	Category    ItemCategory `db:"category" json:"category"`
-	Description string       `db:"description" json:"description"`
-	Volume      float64      `db:"volume" json:"volume"`       // 体积(m³)
-	BasePrice   int64        `db:"base_price" json:"base_price"` // NPC保底价(分)
-	Stackable   bool         `db:"stackable" json:"stackable"`
-	TechLevel   int          `db:"tech_level" json:"tech_level"` // 产业链层级 1-9
+	ID            int64        `db:"id" json:"id"`
+	Name          string       `db:"name" json:"name"`
+	Category      ItemCategory `db:"category" json:"category"`
+	Description   string       `db:"description" json:"description"`
+	Volume        float64      `db:"volume" json:"volume"`
+	BasePrice     int64        `db:"base_price" json:"base_price"`
+	Stackable     bool         `db:"stackable" json:"stackable"`
+	TechLevel     int          `db:"tech_level" json:"tech_level"`
+	SlotType      string       `db:"slot_type" json:"slot_type,omitempty"`
+	ModuleType    string       `db:"module_type" json:"module_type,omitempty"`
+	DamagePerTick int          `db:"damage_per_tick" json:"damage_per_tick,omitempty"`
+	DamageType    string       `db:"damage_type" json:"damage_type,omitempty"`
+	OptimalRange  int          `db:"optimal_range" json:"optimal_range,omitempty"`
+	FalloffRange  int          `db:"falloff_range" json:"falloff_range,omitempty"`
+	TrackingSpeed float64      `db:"tracking_speed" json:"tracking_speed,omitempty"`
+	RateOfFire    int          `db:"rate_of_fire" json:"rate_of_fire,omitempty"`
+	PGCost        int          `db:"pg_cost" json:"pg_cost,omitempty"`
+	CPUCost       int          `db:"cpu_cost" json:"cpu_cost,omitempty"`
+	CapCost       int          `db:"cap_cost" json:"cap_cost,omitempty"`
+	BonusType     string       `db:"bonus_type" json:"bonus_type,omitempty"`
+	BonusValue    float64      `db:"bonus_value" json:"bonus_value,omitempty"`
 }
 
 type InventoryItem struct {

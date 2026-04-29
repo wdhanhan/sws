@@ -144,13 +144,28 @@ func (r *InventoryRepo) GetItemDef(ctx context.Context, id int64) (*model.ItemDe
 	return &item, nil
 }
 
-func (r *InventoryRepo) ListItemDefs(ctx context.Context, category string) ([]model.ItemDef, error) {
-	q := `SELECT id, name, category, description, volume, base_price, stackable, tech_level FROM item_defs`
+func (r *InventoryRepo) ListItemDefs(ctx context.Context, category, slotType string) ([]model.ItemDef, error) {
+	q := `SELECT id, name, category, description, volume, base_price, stackable, tech_level,
+	      COALESCE(slot_type,'') as slot_type, COALESCE(module_type,'') as module_type,
+	      COALESCE(damage_per_tick,0) as damage_per_tick, COALESCE(damage_type,'') as damage_type,
+	      COALESCE(optimal_range,0) as optimal_range, COALESCE(falloff_range,0) as falloff_range,
+	      COALESCE(tracking_speed,0) as tracking_speed, COALESCE(rate_of_fire,1) as rate_of_fire,
+	      COALESCE(pg_cost,0) as pg_cost, COALESCE(cpu_cost,0) as cpu_cost, COALESCE(cap_cost,0) as cap_cost,
+	      COALESCE(bonus_type,'') as bonus_type, COALESCE(bonus_value,0) as bonus_value
+	      FROM item_defs`
 	var items []model.ItemDef
-	if category != "" {
+	switch {
+	case category != "" && slotType != "":
+		err := r.db.SelectContext(ctx, &items, q+` WHERE category = $1 AND slot_type = $2 ORDER BY id`, category, slotType)
+		return items, err
+	case category != "":
 		err := r.db.SelectContext(ctx, &items, q+` WHERE category = $1 ORDER BY id`, category)
 		return items, err
+	case slotType != "":
+		err := r.db.SelectContext(ctx, &items, q+` WHERE slot_type = $1 ORDER BY id`, slotType)
+		return items, err
+	default:
+		err := r.db.SelectContext(ctx, &items, q+` ORDER BY id`)
+		return items, err
 	}
-	err := r.db.SelectContext(ctx, &items, q+` ORDER BY id`)
-	return items, err
 }

@@ -34,7 +34,7 @@ func (e *CombatEngine) ProcessTick() []string {
 
 	logs = append(logs, fmt.Sprintf("═══ Tick %d ═══", e.State.Tick))
 
-	// Auto-target for participants without a target
+	// Auto-target
 	for i := range e.State.Participants {
 		p := &e.State.Participants[i]
 		if p.IsDestroyed {
@@ -48,7 +48,7 @@ func (e *CombatEngine) ProcessTick() []string {
 		}
 	}
 
-	// Process movement: NPCs approach their optimal range
+	// Movement
 	for i := range e.State.Participants {
 		p := &e.State.Participants[i]
 		if p.IsDestroyed || p.TargetID == nil {
@@ -58,8 +58,7 @@ func (e *CombatEngine) ProcessTick() []string {
 		if target == nil {
 			continue
 		}
-		// Move towards optimal range
-		movePerTick := p.Speed * 3 // 3 seconds per tick
+		movePerTick := p.Speed * 3
 		if p.Distance > p.OptimalRange+2000 {
 			p.Distance -= movePerTick
 			if p.Distance < p.OptimalRange {
@@ -68,24 +67,22 @@ func (e *CombatEngine) ProcessTick() []string {
 		} else if p.Distance < p.OptimalRange-2000 && p.Type == "npc" {
 			p.Distance += movePerTick / 2
 		}
-		// Sync distance for target (simplified: both at same distance)
 		target.Distance = p.Distance
 	}
 
-	// Process damage from each participant
+	// Damage
 	for i := range e.State.Participants {
 		attacker := &e.State.Participants[i]
-		if attacker.IsDestroyed || attacker.TargetID == nil {
+		if attacker.IsDestroyed || attacker.TargetID == nil || attacker.DamagePerTick <= 0 {
 			continue
 		}
 
-		// 射速检查：rate_of_fire=N 表示每N个Tick开一次火
 		rof := attacker.RateOfFire
 		if rof <= 0 {
 			rof = 1
 		}
 		if e.State.Tick%rof != 0 {
-			continue // 这个Tick不开火
+			continue
 		}
 
 		target := e.getParticipant(*attacker.TargetID)
@@ -93,18 +90,23 @@ func (e *CombatEngine) ProcessTick() []string {
 			continue
 		}
 
-		// Calculate hit chance
+		// Capacitor check: need enough cap to fire
+		if attacker.CapCost > 0 {
+			if attacker.CapCurrent < attacker.CapCost {
+				continue // not enough cap, skip this shot silently
+			}
+			attacker.CapCurrent -= attacker.CapCost
+		}
+
 		hitChance := e.calculateHitChance(attacker, target)
 		if e.rng.Float64() > hitChance {
 			logs = append(logs, fmt.Sprintf("  %s 对 %s 的攻击未命中", attacker.Name, target.Name))
 			continue
 		}
 
-		// Range falloff
 		rangeMod := e.calculateRangeMod(attacker, target)
 		rawDamage := int(float64(attacker.DamagePerTick) * rangeMod)
 
-		// Apply damage to target
 		actualDamage, hitLayer := e.applyDamage(target, rawDamage, attacker.DamageType)
 
 		logs = append(logs, fmt.Sprintf("  %s 的%s命中 %s 的%s，造成 %d 伤害",
@@ -116,21 +118,33 @@ func (e *CombatEngine) ProcessTick() []string {
 		}
 	}
 
-	// Shield recharge
+	// Shield recharge + armor repair + cap recharge
 	for i := range e.State.Participants {
 		p := &e.State.Participants[i]
 		if p.IsDestroyed {
 			continue
 		}
-		if p.ShieldCurrent < p.ShieldMax {
+		if p.ShieldCurrent < p.ShieldMax && p.ShieldRecharge > 0 {
 			p.ShieldCurrent += p.ShieldRecharge
 			if p.ShieldCurrent > p.ShieldMax {
 				p.ShieldCurrent = p.ShieldMax
 			}
 		}
+		if p.ArmorCurrent < p.ArmorMax && p.ArmorRepair > 0 {
+			p.ArmorCurrent += p.ArmorRepair
+			if p.ArmorCurrent > p.ArmorMax {
+				p.ArmorCurrent = p.ArmorMax
+			}
+		}
+		if p.CapMax > 0 && p.CapCurrent < p.CapMax && p.CapRecharge > 0 {
+			p.CapCurrent += p.CapRecharge
+			if p.CapCurrent > p.CapMax {
+				p.CapCurrent = p.CapMax
+			}
+		}
 	}
 
-	// Check combat end
+	// Victory check
 	teamAAlive := false
 	teamBAlive := false
 	for _, p := range e.State.Participants {
@@ -159,9 +173,30 @@ func (e *CombatEngine) ProcessTick() []string {
 	return logs
 }
 
+// Hit chance uses tracking speed vs target angular velocity (speed/distance*signature).
+// tracking=0 falls back to the old signature-only formula.
 func (e *CombatEngine) calculateHitChance(attacker, target *model.CombatParticipant) float64 {
-	sigRatio := float64(target.Signature) / 100.0
-	baseHit := 0.7 * sigRatio
+	sig := float64(target.Signature)
+	if sig <= 0 {
+		sig = 100
+	}
+
+	if attacker.TrackingSpeed > 0 && target.Speed > 0 && target.Distance > 0 {
+		angularVelocity := float64(target.Speed) / float64(target.Distance)
+		trackingRatio := attacker.TrackingSpeed / angularVelocity
+		sigFactor := sig / 100.0
+		hit := 0.5 * math.Pow(trackingRatio*sigFactor, 2)
+		if hit > 0.95 {
+			hit = 0.95
+		}
+		if hit < 0.1 {
+			hit = 0.1
+		}
+		return hit
+	}
+
+	// Fallback: signature-based
+	baseHit := 0.7 * (sig / 100.0)
 	if baseHit > 0.95 {
 		baseHit = 0.95
 	}
@@ -171,14 +206,24 @@ func (e *CombatEngine) calculateHitChance(attacker, target *model.CombatParticip
 	return baseHit
 }
 
+// Range modifier uses explicit falloff_range when available, else degrades with optimal.
 func (e *CombatEngine) calculateRangeMod(attacker, target *model.CombatParticipant) float64 {
 	dist := target.Distance
 	optimal := attacker.OptimalRange
+	if optimal <= 0 {
+		optimal = 15000
+	}
 	if dist <= optimal {
 		return 1.0
 	}
-	falloff := float64(dist-optimal) / float64(optimal)
-	mod := math.Exp(-falloff * falloff)
+
+	falloffRange := attacker.FalloffRange
+	if falloffRange <= 0 {
+		falloffRange = optimal
+	}
+
+	x := float64(dist-optimal) / float64(falloffRange)
+	mod := math.Exp(-x * x)
 	if mod < 0.1 {
 		return 0.1
 	}
@@ -189,7 +234,6 @@ func (e *CombatEngine) applyDamage(target *model.CombatParticipant, damage int, 
 	totalApplied := 0
 	remaining := damage
 
-	// Shield first — 使用该船的护盾抗性
 	if target.ShieldCurrent > 0 && remaining > 0 {
 		resist := getResistFromProfile(target.ShieldResist, dmgType)
 		shieldDmg := int(float64(remaining) * (1.0 - resist))
@@ -203,7 +247,6 @@ func (e *CombatEngine) applyDamage(target *model.CombatParticipant, damage int, 
 		target.ShieldCurrent = 0
 	}
 
-	// Armor — 使用该船的装甲抗性
 	if target.ArmorCurrent > 0 && remaining > 0 {
 		resist := getResistFromProfile(target.ArmorResist, dmgType)
 		armorDmg := int(float64(remaining) * (1.0 - resist))
@@ -217,7 +260,6 @@ func (e *CombatEngine) applyDamage(target *model.CombatParticipant, damage int, 
 		target.ArmorCurrent = 0
 	}
 
-	// Structure — 统一5%抗性
 	if remaining > 0 {
 		structDmg := int(float64(remaining) * 0.95)
 		target.StructureCurrent -= structDmg

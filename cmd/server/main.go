@@ -57,6 +57,8 @@ func main() {
 	shipService := service.NewShipService(db)
 	dungeonService := service.NewDungeonService(db, inventoryRepo)
 	combatSiteService := service.NewCombatSiteService(db, inventoryRepo)
+	fleetService := service.NewFleetService(db)
+	wreckService := service.NewWreckService(db, inventoryRepo)
 
 	accountHandler := handler.NewAccountHandler(accountService)
 	characterHandler := handler.NewCharacterHandler(characterService)
@@ -69,8 +71,14 @@ func main() {
 	shipHandler := handler.NewShipHandler(shipService)
 	dungeonHandler := handler.NewDungeonHandler(dungeonService)
 	combatSiteHandler := handler.NewCombatSiteHandler(combatSiteService)
+	combatSiteWS := handler.NewCombatSiteWS(combatSiteService, jwtManager)
+	fleetHandler := handler.NewFleetHandler(fleetService)
+	wreckHandler := handler.NewWreckHandler(wreckService)
 
-	router := handler.SetupRouter(cfg.Server.Mode, jwtManager, accountHandler, characterHandler, starmapHandler, economyHandler, combatHandler, skillHandler, orgHandler, worldHandler, shipHandler, dungeonHandler, combatSiteHandler)
+	combatSiteService.SetFleetService(fleetService)
+	dungeonService.SetFleetService(fleetService)
+
+	router := handler.SetupRouter(cfg.Server.Mode, jwtManager, accountHandler, characterHandler, starmapHandler, economyHandler, combatHandler, skillHandler, orgHandler, worldHandler, shipHandler, dungeonHandler, combatSiteHandler, combatSiteWS, fleetHandler, wreckHandler)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	slog.Info("server listening", "addr", addr)

@@ -252,7 +252,8 @@ func (h *EconomyHandler) GetAssets(c *gin.Context) {
 
 func (h *EconomyHandler) GetItemDefs(c *gin.Context) {
 	category := c.Query("category")
-	items, err := h.invRepo.ListItemDefs(c.Request.Context(), category)
+	slotType := c.Query("slot_type")
+	items, err := h.invRepo.ListItemDefs(c.Request.Context(), category, slotType)
 	if err != nil {
 		response.InternalError(c, "获取物品定义失败")
 		return
