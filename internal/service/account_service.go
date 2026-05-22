@@ -3,22 +3,17 @@ package service
 import (
 	"context"
 	"errors"
-	"regexp"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/starfall-warsong/sws/internal/model"
 	"github.com/starfall-warsong/sws/internal/repository"
 	"github.com/starfall-warsong/sws/pkg/auth"
-	"golang.org/x/crypto/bcrypt"
 )
 
 var (
-	ErrPhoneInvalid    = errors.New("手机号格式不正确")
-	ErrPhoneExists     = errors.New("手机号已注册")
-	ErrPasswordTooWeak = errors.New("密码长度至少8位")
-	ErrLoginFailed     = errors.New("手机号或密码错误")
+	ErrAccountInvalid = errors.New("账号长度为2-20个字符")
 )
-
-var phoneRegex = regexp.MustCompile(`^1[3-9]\d{9}$`)
 
 type AccountService struct {
 	repo *repository.AccountRepo
@@ -29,65 +24,43 @@ func NewAccountService(repo *repository.AccountRepo, jwt *auth.JWTManager) *Acco
 	return &AccountService{repo: repo, jwt: jwt}
 }
 
-type RegisterRequest struct {
-	Phone    string `json:"phone" binding:"required"`
-	Password string `json:"password" binding:"required"`
-}
-
 type LoginRequest struct {
-	Phone    string `json:"phone" binding:"required"`
-	Password string `json:"password" binding:"required"`
+	Account string `json:"account" binding:"required"`
 }
 
 type TokenResponse struct {
 	AccessToken  string         `json:"access_token"`
 	RefreshToken string         `json:"refresh_token"`
 	Account      *model.Account `json:"account"`
+	IsNew        bool           `json:"is_new"`
 }
 
-func (s *AccountService) Register(ctx context.Context, req *RegisterRequest) (*TokenResponse, error) {
-	if !phoneRegex.MatchString(req.Phone) {
-		return nil, ErrPhoneInvalid
-	}
-	if len(req.Password) < 8 {
-		return nil, ErrPasswordTooWeak
+func (s *AccountService) LoginOrRegister(ctx context.Context, req *LoginRequest) (*TokenResponse, error) {
+	accountName := strings.TrimSpace(req.Account)
+	if utf8.RuneCountInString(accountName) < 2 || utf8.RuneCountInString(accountName) > 20 {
+		return nil, ErrAccountInvalid
 	}
 
-	existing, err := s.repo.GetByPhone(ctx, req.Phone)
-	if err != nil {
-		return nil, err
-	}
-	if existing != nil {
-		return nil, ErrPhoneExists
-	}
-
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	account, err := s.repo.GetByPhone(ctx, accountName)
 	if err != nil {
 		return nil, err
 	}
 
-	account, err := s.repo.Create(ctx, req.Phone, string(hash))
-	if err != nil {
-		return nil, err
-	}
-
-	return s.generateTokens(account)
-}
-
-func (s *AccountService) Login(ctx context.Context, req *LoginRequest) (*TokenResponse, error) {
-	account, err := s.repo.GetByPhone(ctx, req.Phone)
-	if err != nil {
-		return nil, err
-	}
+	isNew := false
 	if account == nil {
-		return nil, ErrLoginFailed
+		isNew = true
+		account, err = s.repo.Create(ctx, accountName, "")
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(account.PasswordHash), []byte(req.Password)); err != nil {
-		return nil, ErrLoginFailed
+	resp, err := s.generateTokens(account)
+	if err != nil {
+		return nil, err
 	}
-
-	return s.generateTokens(account)
+	resp.IsNew = isNew
+	return resp, nil
 }
 
 func (s *AccountService) generateTokens(account *model.Account) (*TokenResponse, error) {

@@ -38,7 +38,6 @@ func SetupRouter(
 
 	api := r.Group("/api/v1")
 	{
-		api.POST("/register", accountHandler.Register)
 		api.POST("/login", accountHandler.Login)
 	}
 
